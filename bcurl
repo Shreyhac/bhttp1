@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""bcurl [-v] [-I] host[:port][/path] [/path ...] - BHTTP/1 client (Track 2).
+
+Builds the binary request frames, writes the response body to stdout, and
+never opens a second connection: every path is fetched over the one
+connection, waiting for each response to end before sending the next.
+-v hexdumps every frame, sent and received, to stderr. -I sends HEAD.
+Port defaults to 9000, path to "/". IPv6 literals go in brackets: [::1]:9000/.
+BCURL_TIMEOUT (seconds, default 30) bounds the connect and each wait for a
+response frame.
+
+Exit codes: 0 for 1xx-3xx, 4 for 4xx, 5 for 5xx, 1 for a connection or
+protocol error, 2 for bad usage.
+"""
+import socket, sys
+try:
+    from bhttp import *
+    from bhttp import parse_content_length
+except ValueError as e:                 # bad BHTTP_* environment value
+    sys.stderr.write("bcurl: %s\n" % e)
+    sys.exit(2)
+
+USAGE = "usage: bcurl [-v] [-I] host[:port][/path] [/path ...]\n"
+DEFAULT_PORT = 9000
+
+
+def parse_target(arg):
+    """host[:port][/path] -> (host, port, hostport, path). ValueError if bad."""
+    hostport, slash, rest = arg.partition("/")
+    path = "/" + rest
+    if hostport.startswith("["):
+        host, sep, tail = hostport[1:].partition("]")
+        if not sep or (tail and not tail.startswith(":")):
+            raise ValueError("bad IPv6 literal %r" % hostport)
+        port = tail[1:] if tail else ""
+    else:
+        host, _, port = hostport.partition(":")
+    if not host:
+        raise ValueError("missing host")
+    if port == "":
+        port = DEFAULT_PORT
+    elif not (port.isascii() and port.isdigit()) or not 1 <= int(port) <= 65535:
+        raise ValueError("bad port %r" % port)
+    return host, int(port), hostport, path
+
+
+def build_requests(paths, method, hostport):
+    """Every request frame, built and checked before any connection exists."""
+    frames = []
+    for n, path in enumerate(paths):
+        if not path.startswith("/"):
+            raise ValueError("path must start with /: %s" % path)
+        stream = n + 1                               # from 1, increasing
+        req = enc_request(method, path, [("host", hostport),
+                                         ("user-agent", "bcurl/1"),
+                                         ("accept", "*/*")])
+        if len(req) > MAX_PAYLOAD:
+            raise ValueError("request for %.40s... does not fit one frame" % path)
+        frames.append((stream, pack_frame(HEADERS, F_END_STREAM, stream, req)))
+    return frames
+
+
+def main(argv):
+    args = argv[1:]
+    verbose = "-v" in args
+    head = "-I" in args
+    args = [a for a in args if a not in ("-v", "-I")]
+    if not args or any(a.startswith("-") for a in args):
+        sys.stderr.write(USAGE)
+        return 2
+    try:
+        timeout = env_seconds("BCURL_TIMEOUT", 30)
+        host, port, hostport, first = parse_target(args[0])
+        frames = build_requests([first] + args[1:], M_HEAD if head else M_GET, hostport)
+    except ValueError as e:
+        sys.stderr.write("bcurl: %s\n%s" % (e, USAGE))
+        return 2
+
+    def tap(direction, data):
+        if verbose:
+            sys.stderr.write("%s\n%s\n" % (direction, hexdump(data, direction + " ")))
+
+    s = None
+    worst = 0
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)  # the only one
+        s.sendall(PREFACE)
+        tap("->", PREFACE)
+        for stream, frame in frames:
+            s.settimeout(timeout)           # a leftover receive deadline must not bound a send
+            s.sendall(frame)
+            tap("->", frame)
+            status = read_response(s, stream, head, tap, verbose, timeout)
+            if status >= 400:
+                worst = max(worst, status)
+        s.settimeout(timeout)
+        goaway_close(s, E_NONE, tap)
+        s = None
+        return 4 if 400 <= worst < 500 else 5 if worst >= 500 else 0
+    except PeerGoaway as e:
+        sys.stderr.write("bcurl: %s\n" % e)          # never answer a GOAWAY
+        return 1
+    except FramingError as e:
+        sys.stderr.write("bcurl: %s\n" % e)
+        if s is not None:
+            s.settimeout(timeout)
+            goaway_close(s, e.code, tap)
+            s = None
+        return 1
+    except EOFError:
+        sys.stderr.write("bcurl: server closed the connection mid-response\n")
+        return 1
+    except OSError as e:                             # refused, DNS, reset
+        sys.stderr.write("bcurl: %s\n" % e)
+        return 1
+    finally:
+        if s is not None:
+            s.close()
+
+
+def read_response(s, stream, head, tap, verbose=False, timeout=None):
+    """Read one response. Returns the status. Writes DATA to stdout for GET.
+
+    Protocol errors (FramingError, sent back as GOAWAY), SPEC section 9: a
+    known-type frame on any stream but the one being waited on, DATA before
+    HEADERS, a second HEADERS, a malformed response payload, a status outside
+    100-599, a missing content-length or one that is not 1 to 18 ASCII
+    digits, HEADERS without END_STREAM on a HEAD or 304 response (so DATA can
+    never follow one), and DATA totalling more or less than content-length.
+    Excess bytes are caught before they are written. A received GOAWAY
+    raises PeerGoaway."""
+    status = None
+    want = got = 0
+    no_body = False
+    while True:
+        try:
+            ftype, flags, sid, payload = read_frame(s, tap=tap, idle=timeout)
+        except socket.timeout:
+            raise FramingError("no response frame within %gs, giving up" % timeout, E_NONE)
+        if ftype == GOAWAY:
+            raise PeerGoaway(goaway_code(sid, payload))
+        if ftype not in (HEADERS, DATA):
+            continue                                # unknown type: skip cleanly
+        if sid != stream:
+            raise FramingError("frame for stream %d while waiting on %d" % (sid, stream))
+        if ftype == HEADERS:
+            if status is not None:
+                raise FramingError("second HEADERS on stream %d" % stream)
+            try:
+                status, pairs = dec_response(payload)
+                hdrs = dict(pairs)
+                if "content-length" not in hdrs:
+                    raise Malformed("no content-length in response")
+                want = parse_content_length(hdrs["content-length"])
+            except Malformed as e:
+                raise FramingError("malformed response: %s" % e)
+            if not 100 <= status <= 599:
+                raise FramingError("status %d out of range" % status)
+            no_body = head or status == 304
+            if verbose:
+                sys.stderr.write("< status %d %s\n" % (status, pairs))
+            if no_body and not flags & F_END_STREAM:
+                raise FramingError("HEADERS without END_STREAM on a %s response"
+                                   % ("HEAD" if head else "304"))
+        else:                                       # DATA
+            if status is None:
+                raise FramingError("DATA before HEADERS")
+            got += len(payload)
+            if got > want:
+                raise FramingError("DATA exceeds content-length %d" % want)
+            try:
+                sys.stdout.buffer.write(payload)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                # the consumer (for example `head`) went away: say goodbye,
+                # then exit without a shutdown-flush traceback
+                goaway_close(s, E_NONE, tap)
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+                raise SystemExit(1)
+        if flags & F_END_STREAM:
+            break
+    if not no_body and got != want:
+        raise FramingError("got %d DATA bytes, content-length said %d" % (got, want))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
